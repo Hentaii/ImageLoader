@@ -3,6 +3,7 @@ package com.example.gan.imageloader;
 import android.annotation.TargetApi;
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
@@ -15,10 +16,13 @@ import android.widget.ImageView;
 import com.jakewharton.disklrucache.DiskLruCache;
 import com.orhanobut.logger.Logger;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.Executor;
@@ -27,6 +31,10 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
 
 /**
@@ -43,7 +51,7 @@ public class ImageLoader {
     // 非核心线程闲置的超时时长
     private static final long KEEP_ALIVE = 10L;
     // URI的TAG
-    private static final int TAG_KEY_URI = 0;
+    private static final int TAG_KEY_URI = R.id.imageloader_uri;
 
     // 工厂模式创造线程
     private static final ThreadFactory sThreadFactory = new ThreadFactory() {
@@ -61,6 +69,7 @@ public class ImageLoader {
             new LinkedBlockingQueue<Runnable>(), sThreadFactory);
     private static final long DISK_CACHE_SIZE = 1024 * 1024 * 50;
     private static final int DISK_CACHE_INDEX = 0;
+    private static final int IO_BUFFER_SIZE = 8 * 1024;
 
     private boolean mIsDiskLruCacheCreater = false;
 
@@ -175,7 +184,7 @@ public class ImageLoader {
         bindBitmap(uri, imageView, 0, 0);
     }
 
-    private void bindBitmap(final String uri, final ImageView imageView, final int reqWidth, final int reqHeight) {
+    public void bindBitmap(final String uri, final ImageView imageView, final int reqWidth, final int reqHeight) {
         imageView.setTag(TAG_KEY_URI, uri);
         Bitmap bitmap = loadBitmapFromMemCache(uri);
         if (bitmap != null) {
@@ -226,6 +235,7 @@ public class ImageLoader {
         return bitmap;
     }
 
+
     /**
      * 通过uri读取内存缓存
      */
@@ -238,6 +248,30 @@ public class ImageLoader {
     /**
      * 通过uri读取磁盘缓存
      */
+
+    private Bitmap loadBitmapFromHttp(String url, int reqWidth, int reqHeight) throws IOException {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            throw new RuntimeException("can not visit network from UI thread");
+        }
+        if (mDiskLruCache == null) {
+            return null;
+        }
+
+        //添加磁盘缓存
+        String key = hashKeyFormUrl(url);
+        DiskLruCache.Editor editor = mDiskLruCache.edit(key);
+        if (editor != null) {
+            OutputStream outputStream = editor.newOutputStream(DISK_CACHE_INDEX);
+            if (downloadUrlToStream(url, outputStream)) {
+                editor.commit();
+            } else {
+                editor.abort();
+            }
+            mDiskLruCache.flush();
+        }
+        return loadBitmapFromDiskCache(url, reqWidth, reqHeight);
+    }
+
     private Bitmap loadBitmapFromDiskCache(String uri, int width, int height) throws IOException {
         //不允许在UI线程读取磁盘
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -252,7 +286,73 @@ public class ImageLoader {
         if (snapshot != null) {
             FileInputStream fileInputStream = (FileInputStream) snapshot.getInputStream(DISK_CACHE_INDEX);
             FileDescriptor fileDescriptor = fileInputStream.getFD();
-            bitmap = mImageResizer
+            bitmap = mImageResizer.decodeSampledBitmapFromFileDescriptor(fileDescriptor, width, height);
+            if (bitmap != null) {
+                addBitmapToMemoryCache(key, bitmap);
+            }
+        }
+        return bitmap;
+    }
+
+    /**
+     * 从网络下载url并且储存在流中
+     */
+    private boolean downloadUrlToStream(String url, OutputStream outputStream) {
+        BufferedInputStream in = null;
+        BufferedOutputStream out = null;
+        OkHttpClient client = new OkHttpClient();
+        Request request = new Request.Builder()
+                .url(url)
+                .build();
+        try {
+            Response response = client.newCall(request).execute();
+            in = new BufferedInputStream(response.body().byteStream(), IO_BUFFER_SIZE);
+            out = new BufferedOutputStream(outputStream, IO_BUFFER_SIZE);
+            int b;
+            while ((b = in.read()) != -1) {
+                out.write(b);
+            }
+            return true;
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+
+                if (in != null) {
+                    in.close();
+                }
+                if (out != null) {
+                    out.close();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 从网络下载bitmap，并且不进行磁盘缓存
+     */
+    private Bitmap downloadBitmapFromUrl(String url) {
+        Bitmap bitmap = null;
+        BufferedInputStream in = null;
+        OkHttpClient client = new OkHttpClient();
+        Request request = new Request.Builder()
+                .url(url)
+                .build();
+        try {
+            Response response = client.newCall(request).execute();
+            in = new BufferedInputStream(response.body().byteStream(), IO_BUFFER_SIZE);
+            bitmap = BitmapFactory.decodeStream(in);
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                in.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
         return bitmap;
     }
